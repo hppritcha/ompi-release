@@ -21,7 +21,6 @@
 
 #include "opal_stdint.h"
 #include "opal/mca/base/mca_base_var.h"
-#include "opal/mca/hwloc/base/base.h"
 #include "opal/util/opal_environ.h"
 #include "opal/util/output.h"
 #include "opal/util/proc.h"
@@ -62,7 +61,6 @@ static int cray_lookup(const char service_name[],
 static int cray_unpublish(const char service_name[],
                           opal_list_t *info);
 static bool cray_get_attr(const char *attr, opal_value_t **kv);
-static int kvs_get(const char key[], char value [], int maxvalue);
 
 const opal_pmix_base_module_t opal_pmix_cray_module = {
     cray_init,
@@ -108,13 +106,6 @@ static int *pmix_lranks = NULL;
 static opal_process_name_t pmix_pname;
 static uint32_t pmix_jobid = -1;
 
-
-static char* pmix_packed_data = NULL;
-static int pmix_packed_data_offset = 0;
-static char* pmix_packed_encoded_data = NULL;
-static int pmix_packed_encoded_data_offset = 0;
-static int pmix_pack_key = 0;
-static bool pmix_got_modex_data = false;
 
 static char* pmix_error(int pmix_err);
 #define OPAL_PMI_ERROR(pmi_err, pmi_func)                       \
@@ -297,23 +288,6 @@ static int cray_job_disconnect(const char jobId[])
     return OPAL_ERR_NOT_IMPLEMENTED;
 }
 
-static int kvs_put(const char key[], const char value[])
-{
-
-    int rc;
-
-    opal_output_verbose(10, opal_pmix_base_framework.framework_output,
-                        "%s pmix:cray kvs_put key %s  value %s",
-                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), key, value);
-
-    rc =  PMI2_KVS_Put(key, value);
-    if( PMI_SUCCESS != rc ){
-        OPAL_PMI_ERROR(rc, "PMI2_KVS_Put");
-        return OPAL_ERROR;
-    }
-    return OPAL_SUCCESS;
-}
-
 static int cray_put(opal_pmix_scope_t scope,
                   opal_value_t *kv)
 {
@@ -327,7 +301,7 @@ static int cray_put(opal_pmix_scope_t scope,
      */
 
     if (NULL == mca_pmix_cray_component.cache_global) {
-        mca_pmix_native_component.cache_global = OBJ_NEW(opal_buffer_t);
+        mca_pmix_cray_component.cache_global = OBJ_NEW(opal_buffer_t);
     }
 
     opal_output_verbose(20, opal_pmix_base_framework.framework_output,
@@ -342,27 +316,29 @@ static int cray_put(opal_pmix_scope_t scope,
 
 static int cray_fence(opal_process_name_t *procs, size_t nprocs)
 {
-    int rc;
+    int rc, cnt;
     int32_t i;
-    int *all_lens;
-    opal_value_t *kp, kvn;
-    opal_hwloc_locality_t locality;
-    opal_buffer_t *send_buffer;
-    void *sbuf_ptr,*rbuf = NULL;
+    int *all_lens = NULL;
+    opal_value_t *kp;
+    opal_buffer_t *send_buffer = NULL;
+    opal_buffer_t *buf = NULL;
+    void *sbuf_ptr;
+    char *cptr, *rcv_buff = NULL;
     opal_process_name_t id;
     typedef struct {
         uint32_t pmix_rank;
         opal_process_name_t name;
-        uint32_t nbytes;
+        int32_t nbytes;
     } bytes_and_rank_t;
+    int32_t rcv_nbytes_tot;
     bytes_and_rank_t s_bytes_and_rank;
     bytes_and_rank_t *r_bytes_and_ranks = NULL;
 
     opal_output_verbose(2, opal_pmix_base_framework.framework_output,
                         "%s pmix:cray executing fence on %u procs cache_global %p cache_local %p",
                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), (unsigned int)nprocs,
-                        mca_pmix_cray_component.cache_global,
-                        mca_pmix_cray_component.cache_local);
+                        (void *)mca_pmix_cray_component.cache_global,
+                        (void *)mca_pmix_cray_component.cache_local);
 
     /*
      * "unload" the cache_local/cache_global buffers, first copy
@@ -375,15 +351,15 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
         return OPAL_ERR_OUT_OF_RESOURCE;
     }
 
-    opal_dss.copy_payload(send_buffer, buf);
+    opal_dss.copy_payload(send_buffer, mca_pmix_cray_component.cache_global);
     opal_dss.unload(send_buffer, &sbuf_ptr, &s_bytes_and_rank.nbytes);
     s_bytes_and_rank.pmix_rank = pmix_rank;
     s_bytes_and_rank.name = OPAL_PROC_MY_NAME;
 
-    r_bytes_and_ranks = (int *)malloc(pmix_size * sizeof(bytes_and_rank_t));
-    if (NULL == rcv_nbytes) {
+    r_bytes_and_ranks = (bytes_and_rank_t *)malloc(pmix_size * sizeof(bytes_and_rank_t));
+    if (NULL == r_bytes_and_ranks) {
         rc = OPAL_ERR_OUT_OF_RESOURCE;
-        goto fn_fail_w_sbuf;
+        goto fn_exit;
     }
 
     /*
@@ -393,47 +369,49 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
      * the same for the duration of a job - assuming no node failures.
      */
 
-    if (PMI_SUCCESS == (rc = PMI_Allgather(&s_bytes_and_rank,rcv_nbytes,sizeof(bytes_and_rank_t)))) {
+    if (PMI_SUCCESS != (rc = PMI_Allgather(&s_bytes_and_rank,r_bytes_and_ranks,sizeof(bytes_and_rank_t)))) {
         OPAL_PMI_ERROR(rc,"PMI_Allgather");
-        goto fn_fail_w_rcv_nbytes;
+        rc = OPAL_ERR_COMM_FAILURE;
+        goto fn_exit;
     }
 
     for (rcv_nbytes_tot=0,i=0; i < pmix_size; i++) {
-        rcv_nbytes_tot += rcv_nbytes[i].bytes;
+        rcv_nbytes_tot += r_bytes_and_ranks[i].nbytes;
     }
 
-    rcv_buff = (char *) malloc(sizeof(rcv_nbytes_tot);
+    rcv_buff = (char *) malloc(rcv_nbytes_tot * sizeof(char));
     if (NULL == rcv_buff) {
         rc = OPAL_ERR_OUT_OF_RESOURCE;
-        goto fn_fail_w_sbuf;
+        goto fn_exit;
     }
 
     all_lens = (int *)malloc(sizeof(int) * pmix_size);
     if (NULL == all_lens) {
         rc = OPAL_ERR_OUT_OF_RESOURCE;
-        goto fn_fail_w_sbuf;
+        goto fn_exit;
     }
     for (i=0; i< pmix_size; i++) {
-        all_lens[rcv_nbytes[i].pmix_rank] = rcv_nbytes[i].bytes;
+        all_lens[r_bytes_and_ranks[i].pmix_rank] = r_bytes_and_ranks[i].nbytes;
     }
 
     if (PMI_SUCCESS == (rc = PMI_Allgatherv(sbuf_ptr,s_bytes_and_rank.nbytes,rcv_buff,all_lens))) {
         OPAL_PMI_ERROR(rc,"PMI_Allgatherv");
-        goto fn_fail_w_sbuf;
+        rc = OPAL_ERR_COMM_FAILURE;
+        goto fn_exit;
     }
 
     for (cptr = rcv_buff, i=0; i<pmix_size; i++) {
 
-        id = rcv_nbytes[i].pmpix_rank;
+        id = r_bytes_and_ranks[i].name;
         OBJ_CONSTRUCT(&buf, opal_buffer_t);
-        opal_dss.load(&buf, cptr, rcv_nbytes[i].bytes);
+        opal_dss.load(buf, (void *)cptr, r_bytes_and_ranks[i].nbytes);
 
         /* unpack and stuff in to the dstore */
 
         while (OPAL_SUCCESS == (rc = opal_dss.unpack(buf, &kp, &cnt, OPAL_VALUE))) {
-            if (OPAL_SUCCESS != (ret = opal_dstore.store(opal_dstore_internal, 
+            if (OPAL_SUCCESS != (rc = opal_dstore.store(opal_dstore_internal, 
                                                          &id, kp))) {
-                OPAL_ERROR_LOG(ret);
+                OPAL_ERROR_LOG(rc);
             }
              OBJ_RELEASE(kp);
              cnt = 1;
@@ -441,14 +419,19 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
 
         /* free up the memory used by the opal buffer */
         OBJ_DESTRUCT(buf);
-        cptr += rcv_bytes[i].bytes;
+        cptr += r_bytes_and_ranks[i].nbytes;
 
     }
 
     opal_output_verbose(2, opal_pmix_base_framework.framework_output,
                         "%s pmix:cray kvs_fence complete",
                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME));
-    return OPAL_SUCCESS;
+fn_exit:
+    if (all_lens != NULL) free(all_lens);
+    if (rcv_buff != NULL) free(rcv_buff);
+    if (r_bytes_and_ranks != NULL) free(r_bytes_and_ranks);
+    if (send_buffer != NULL) OBJ_RELEASE(send_buffer);
+    return rc;
 }
 
 static int cray_get(const opal_process_name_t *id, const char *key, opal_value_t **kv)
@@ -462,8 +445,8 @@ static int cray_get(const opal_process_name_t *id, const char *key, opal_value_t
                         OPAL_NAME_PRINT(*id), key);
 
     OBJ_CONSTRUCT(&vals, opal_list_t);
-    rc == opal_dstore.fetch(opal_dstore_internal, id, key, &vals);
-    if (rc == OPAL_SUCCESS) {
+    rc = opal_dstore.fetch(opal_dstore_internal, id, key, &vals);
+    if (OPAL_SUCCESS == rc) {
         *kv = (opal_value_t*)opal_list_remove_first(&vals);
         opal_output_verbose(2, opal_pmix_base_framework.framework_output,
                 "%s pmix:cray value retrieved from dstore",
