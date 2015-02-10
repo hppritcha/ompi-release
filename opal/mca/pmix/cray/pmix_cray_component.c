@@ -30,6 +30,7 @@ const char *opal_pmix_cray_component_version_string =
 /*
  * Local function
  */
+static int pmix_cray_component_open(void);
 static int pmix_cray_component_query(mca_base_module_t **module, int *priority);
 static int pmix_cray_component_close(void);
 
@@ -39,7 +40,7 @@ static int pmix_cray_component_close(void);
  * and pointers to our public functions in it
  */
 
-const opal_pmix_base_component_t mca_pmix_cray_component = {
+const opal_pmix_cray_component_t mca_pmix_cray_component = {
 
     /* First, the mca_component_t struct containing meta information
        about the component itself */
@@ -59,7 +60,7 @@ const opal_pmix_base_component_t mca_pmix_cray_component = {
 
         /* Component open and close functions */
 
-        NULL,
+        pmix_cray_component_open,
         pmix_cray_component_close,
         pmix_cray_component_query,
         NULL
@@ -70,6 +71,12 @@ const opal_pmix_base_component_t mca_pmix_cray_component = {
         MCA_BASE_METADATA_PARAM_CHECKPOINT
     }
 };
+
+static int pmix_cray_component_open(void)
+{
+    mca_pmix_native_component.cache_local = NULL;
+    mca_pmix_native_component.cache_global = NULL;
+}
 
 static int pmix_cray_component_query(mca_base_module_t **module, int *priority)
 {

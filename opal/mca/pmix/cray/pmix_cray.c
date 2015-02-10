@@ -322,28 +322,20 @@ static int cray_put(opal_pmix_scope_t scope,
     opal_output_verbose(10, opal_pmix_base_framework.framework_output,
                         "%s pmix:cray cray_put key %s\n",
                          OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key);
+    /*
+     * for now just always just global cache
+     */
 
-    if (OPAL_SUCCESS != (rc = opal_pmix_base_store_encoded (kv->key, (void*)&kv->data, kv->type, 
-                                                            &pmix_packed_data, &pmix_packed_data_offset))) {
+    if (NULL == mca_pmix_cray_component.cache_global) {
+        mca_pmix_native_component.cache_global = OBJ_NEW(opal_buffer_t);
+    }
+
+    opal_output_verbose(20, opal_pmix_base_framework.framework_output,
+                        "%s pmix:cray put global data for key %s",
+                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key);
+    if (OPAL_SUCCESS != (rc = opal_dss.pack(mca_pmix_cray_component.cache_global, &kv, 1, OPAL_VALUE))) {
         OPAL_ERROR_LOG(rc);
-        return rc;
     }
-
-    if (pmix_packed_data_offset == 0) {
-        /* nothing to write */
-        return OPAL_SUCCESS;
-    }
-
-    if (((pmix_packed_data_offset/3)*4) + pmix_packed_encoded_data_offset < pmix_vallen_max) {
-        /* this meta-key is still being filled,
-         * nothing to put yet
-         */
-        return OPAL_SUCCESS;
-    }
-
-    rc = opal_pmix_base_partial_commit_packed (&pmix_packed_data, &pmix_packed_data_offset,
-                                               &pmix_packed_encoded_data, &pmix_packed_encoded_data_offset,
-                                               pmix_vallen_max, &pmix_pack_key, kvs_put);
 
     return rc;
 }
@@ -352,96 +344,138 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
 {
     int rc;
     int32_t i;
+    int *all_lens;
     opal_value_t *kp, kvn;
     opal_hwloc_locality_t locality;
+    opal_buffer_t *send_buffer;
+    void *sbuf_ptr,*rbuf = NULL;
+    opal_process_name_t id;
+    typedef struct {
+        uint32_t pmix_rank;
+        opal_process_name_t name;
+        uint32_t nbytes;
+    } bytes_and_rank_t;
+    bytes_and_rank_t s_bytes_and_rank;
+    bytes_and_rank_t *r_bytes_and_ranks = NULL;
 
     opal_output_verbose(2, opal_pmix_base_framework.framework_output,
-                        "%s pmix:cray called fence",
-                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME));
+                        "%s pmix:cray executing fence on %u procs cache_global %p cache_local %p",
+                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), (unsigned int)nprocs,
+                        mca_pmix_cray_component.cache_global,
+                        mca_pmix_cray_component.cache_local);
 
-    /* check if there is partially filled meta key and put them */
-    opal_pmix_base_commit_packed (&pmix_packed_data, &pmix_packed_data_offset,
-                                  &pmix_packed_encoded_data, &pmix_packed_encoded_data_offset,
-                                  pmix_vallen_max, &pmix_pack_key, kvs_put);
+    /*
+     * "unload" the cache_local/cache_global buffers, first copy
+     * it so we can continue to use the local buffers if further
+     * calls to put can be made
+     */
 
-    if (PMI_SUCCESS != (rc = PMI2_KVS_Fence())) {
-        OPAL_PMI_ERROR(rc, "PMI2_KVS_Fence");
-        return OPAL_ERROR;
+    send_buffer = OBJ_NEW(opal_buffer_t);
+    if (NULL == send_buffer) {
+        return OPAL_ERR_OUT_OF_RESOURCE;
+    }
+
+    opal_dss.copy_payload(send_buffer, buf);
+    opal_dss.unload(send_buffer, &sbuf_ptr, &s_bytes_and_rank.nbytes);
+    s_bytes_and_rank.pmix_rank = pmix_rank;
+    s_bytes_and_rank.name = OPAL_PROC_MY_NAME;
+
+    r_bytes_and_ranks = (int *)malloc(pmix_size * sizeof(bytes_and_rank_t));
+    if (NULL == rcv_nbytes) {
+        rc = OPAL_ERR_OUT_OF_RESOURCE;
+        goto fn_fail_w_sbuf;
+    }
+
+    /*
+     * gather up all the buffer sizes and rank order.
+     * doing this step below since the cray pmi PMI_Allgather doesn't deliver
+     * the gathered data necessarily in PMI rank order, although the order stays
+     * the same for the duration of a job - assuming no node failures.
+     */
+
+    if (PMI_SUCCESS == (rc = PMI_Allgather(&s_bytes_and_rank,rcv_nbytes,sizeof(bytes_and_rank_t)))) {
+        OPAL_PMI_ERROR(rc,"PMI_Allgather");
+        goto fn_fail_w_rcv_nbytes;
+    }
+
+    for (rcv_nbytes_tot=0,i=0; i < pmix_size; i++) {
+        rcv_nbytes_tot += rcv_nbytes[i].bytes;
+    }
+
+    rcv_buff = (char *) malloc(sizeof(rcv_nbytes_tot);
+    if (NULL == rcv_buff) {
+        rc = OPAL_ERR_OUT_OF_RESOURCE;
+        goto fn_fail_w_sbuf;
+    }
+
+    all_lens = (int *)malloc(sizeof(int) * pmix_size);
+    if (NULL == all_lens) {
+        rc = OPAL_ERR_OUT_OF_RESOURCE;
+        goto fn_fail_w_sbuf;
+    }
+    for (i=0; i< pmix_size; i++) {
+        all_lens[rcv_nbytes[i].pmix_rank] = rcv_nbytes[i].bytes;
+    }
+
+    if (PMI_SUCCESS == (rc = PMI_Allgatherv(sbuf_ptr,s_bytes_and_rank.nbytes,rcv_buff,all_lens))) {
+        OPAL_PMI_ERROR(rc,"PMI_Allgatherv");
+        goto fn_fail_w_sbuf;
+    }
+
+    for (cptr = rcv_buff, i=0; i<pmix_size; i++) {
+
+        id = rcv_nbytes[i].pmpix_rank;
+        OBJ_CONSTRUCT(&buf, opal_buffer_t);
+        opal_dss.load(&buf, cptr, rcv_nbytes[i].bytes);
+
+        /* unpack and stuff in to the dstore */
+
+        while (OPAL_SUCCESS == (rc = opal_dss.unpack(buf, &kp, &cnt, OPAL_VALUE))) {
+            if (OPAL_SUCCESS != (ret = opal_dstore.store(opal_dstore_internal, 
+                                                         &id, kp))) {
+                OPAL_ERROR_LOG(ret);
+            }
+             OBJ_RELEASE(kp);
+             cnt = 1;
+        }
+
+        /* free up the memory used by the opal buffer */
+        OBJ_DESTRUCT(buf);
+        cptr += rcv_bytes[i].bytes;
+
     }
 
     opal_output_verbose(2, opal_pmix_base_framework.framework_output,
                         "%s pmix:cray kvs_fence complete",
                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME));
-
-    /* get the modex data from each local process and set the
-     * localities to avoid having the MPI layer fetch data
-     * for every process in the job */
-    if (!pmix_got_modex_data) {
-        pmix_got_modex_data = true;
-        /* we only need to set locality for each local rank as "not found"
-         * equates to "non-local" */
-        for (i=0; i < pmix_nlranks; i++) {
-            pmix_pname.vpid = pmix_lranks[i];
-            rc = opal_pmix_base_cache_keys_locally(&pmix_pname, OPAL_DSTORE_CPUSET,
-                                                   &kp, pmix_kvs_name, pmix_vallen_max, kvs_get);
-            if (OPAL_SUCCESS != rc) {
-                OPAL_ERROR_LOG(rc);
-                return rc;
-            }
-#if OPAL_HAVE_HWLOC
-            if (NULL == kp || NULL == kp->data.string) {
-                /* if we share a node, but we don't know anything more, then
-                 * mark us as on the node as this is all we know
-                 */
-                locality = OPAL_PROC_ON_CLUSTER | OPAL_PROC_ON_CU | OPAL_PROC_ON_NODE;
-            } else {
-                /* determine relative location on our node */
-                locality = opal_hwloc_base_get_relative_locality(opal_hwloc_topology,
-                                                                 opal_process_info.cpuset,
-                                                                 kp->data.string);
-            }
-            if (NULL != kp) {
-                OBJ_RELEASE(kp);
-            }
-#else
-            /* all we know is we share a node */
-            locality = OPAL_PROC_ON_CLUSTER | OPAL_PROC_ON_CU | OPAL_PROC_ON_NODE;
-#endif
-            OPAL_OUTPUT_VERBOSE((1, opal_pmix_base_framework.framework_output,
-                                 "%s pmix:s2 proc %s locality %s",
-                                 OPAL_NAME_PRINT(OPAL_PROC_MY_NAME),
-                                 OPAL_NAME_PRINT(pmix_pname),
-                                 opal_hwloc_base_print_locality(locality)));
-
-            OBJ_CONSTRUCT(&kvn, opal_value_t);
-            kvn.key = strdup(OPAL_DSTORE_LOCALITY);
-            kvn.type = OPAL_UINT16;
-            kvn.data.uint16 = locality;
-            (void)opal_dstore.store(opal_dstore_internal, &pmix_pname, &kvn);
-            OBJ_DESTRUCT(&kvn);
-        }
-    }
-
-    return OPAL_SUCCESS;
-}
-
-static int kvs_get(const char key[], char value [], int maxvalue)
-{
-    int rc;
-    int len;
-
-    rc = PMI2_KVS_Get(pmix_kvs_name, PMI2_ID_NULL, key, value, maxvalue, &len);
-    if( PMI_SUCCESS != rc ){
-        OPAL_PMI_ERROR(rc, "PMI2_KVS_Get");
-        return OPAL_ERROR;
-    }
     return OPAL_SUCCESS;
 }
 
 static int cray_get(const opal_process_name_t *id, const char *key, opal_value_t **kv)
 {
     int rc;
-    rc = opal_pmix_base_cache_keys_locally(id, key, kv, pmix_kvs_name, pmix_vallen_max, kvs_get);
+    opal_list_t vals;
+
+    opal_output_verbose(2, opal_pmix_base_framework.framework_output,
+                        "%s pmix:cray getting value for proc %s key %s",
+                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME),
+                        OPAL_NAME_PRINT(*id), key);
+
+    OBJ_CONSTRUCT(&vals, opal_list_t);
+    rc == opal_dstore.fetch(opal_dstore_internal, id, key, &vals);
+    if (rc == OPAL_SUCCESS) {
+        *kv = (opal_value_t*)opal_list_remove_first(&vals);
+        opal_output_verbose(2, opal_pmix_base_framework.framework_output,
+                "%s pmix:cray value retrieved from dstore",
+                OPAL_NAME_PRINT(OPAL_PROC_MY_NAME));
+        return OPAL_SUCCESS;
+    } else {
+        opal_output_verbose(2, opal_pmix_base_framework.framework_output,
+                "%s pmix:cray fetch from dstore failed: %d",
+                OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), rc);
+    }
+    OPAL_LIST_DESTRUCT(&vals);
+
     return rc;
 }
 
