@@ -294,8 +294,8 @@ static int cray_put(opal_pmix_scope_t scope,
     int rc;
 
     opal_output_verbose(10, opal_pmix_base_framework.framework_output,
-                        "%s pmix:cray cray_put key %s\n",
-                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key);
+                        "%s pmix:cray cray_put key %s scope %d\n",
+                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key, scope);
     /*
      * for now just always just global cache
      */
@@ -305,9 +305,10 @@ static int cray_put(opal_pmix_scope_t scope,
     }
 
     opal_output_verbose(20, opal_pmix_base_framework.framework_output,
-                        "%s pmix:cray put global data for key %s",
-                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key);
+                        "%s pmix:cray put global data for key %s type %d",
+                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kv->key, kv->type);
     if (OPAL_SUCCESS != (rc = opal_dss.pack(mca_pmix_cray_component.cache_global, &kv, 1, OPAL_VALUE))) {
+        OPAL_PMI_ERROR(rc,"pmix:cray opal_dss.pack returned error");
         OPAL_ERROR_LOG(rc);
     }
 
@@ -323,7 +324,7 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
     opal_buffer_t *send_buffer = NULL;
     opal_buffer_t *buf = NULL;
     void *sbuf_ptr;
-    char *cptr, *rcv_buff = NULL;
+    char *cptr, *foo_ptr, *rcv_buff = NULL;
     opal_process_name_t id;
     typedef struct {
         uint32_t pmix_rank;
@@ -375,9 +376,14 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
         goto fn_exit;
     }
 
+
     for (rcv_nbytes_tot=0,i=0; i < pmix_size; i++) {
         rcv_nbytes_tot += r_bytes_and_ranks[i].nbytes;
     }
+
+    opal_output_verbose(20, opal_pmix_base_framework.framework_output,
+                        "%s pmix:cray total number of bytes to receive %d",
+                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), rcv_nbytes_tot);
 
     rcv_buff = (char *) malloc(rcv_nbytes_tot * sizeof(char));
     if (NULL == rcv_buff) {
@@ -394,32 +400,58 @@ static int cray_fence(opal_process_name_t *procs, size_t nprocs)
         all_lens[r_bytes_and_ranks[i].pmix_rank] = r_bytes_and_ranks[i].nbytes;
     }
 
-    if (PMI_SUCCESS == (rc = PMI_Allgatherv(sbuf_ptr,s_bytes_and_rank.nbytes,rcv_buff,all_lens))) {
+    if (PMI_SUCCESS != (rc = PMI_Allgatherv(sbuf_ptr,s_bytes_and_rank.nbytes,rcv_buff,all_lens))) {
         OPAL_PMI_ERROR(rc,"PMI_Allgatherv");
         rc = OPAL_ERR_COMM_FAILURE;
         goto fn_exit;
     }
 
-    for (cptr = rcv_buff, i=0; i<pmix_size; i++) {
+    OBJ_RELEASE(send_buffer);
+    send_buffer  = NULL;
+
+    opal_output_verbose(10, opal_pmix_base_framework.framework_output,
+                        "%s pmix:cray rcv_buff = %p",
+                        OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), rcv_buff);
+
+
+    for (cptr = rcv_buff, i=0; i < pmix_size; i++) {
+
+        foo_ptr = (char *)malloc(r_bytes_and_ranks[i].nbytes);
+        memcpy(foo_ptr,cptr,r_bytes_and_ranks[i].nbytes);
 
         id = r_bytes_and_ranks[i].name;
-        OBJ_CONSTRUCT(&buf, opal_buffer_t);
-        opal_dss.load(buf, (void *)cptr, r_bytes_and_ranks[i].nbytes);
+
+        buf = OBJ_NEW(opal_buffer_t);
+        if (buf == NULL) {
+            rc = OPAL_ERR_OUT_OF_RESOURCE;
+            goto fn_exit;
+        }
+
+        if (OPAL_SUCCESS != (rc = opal_dss.load(buf, (void *)foo_ptr, r_bytes_and_ranks[i].nbytes))) {
+            OPAL_PMI_ERROR(rc,"pmix:cray opal_dss.load failed");
+            goto fn_exit;
+        }
 
         /* unpack and stuff in to the dstore */
 
+        cnt = 1;
         while (OPAL_SUCCESS == (rc = opal_dss.unpack(buf, &kp, &cnt, OPAL_VALUE))) {
+            opal_output_verbose(20, opal_pmix_base_framework.framework_output,
+                        "%s pmix:cray unpacked kp with key %s type(%d) for id  %s", 
+                         OPAL_NAME_PRINT(OPAL_PROC_MY_NAME), kp->key, kp->type, OPAL_NAME_PRINT(id));
             if (OPAL_SUCCESS != (rc = opal_dstore.store(opal_dstore_internal, 
                                                          &id, kp))) {
                 OPAL_ERROR_LOG(rc);
+                goto fn_exit;
             }
              OBJ_RELEASE(kp);
              cnt = 1;
         }
 
         /* free up the memory used by the opal buffer */
-        OBJ_DESTRUCT(buf);
         cptr += r_bytes_and_ranks[i].nbytes;
+        OBJ_RELEASE(buf);
+        buf = NULL;
 
     }
 
@@ -430,7 +462,6 @@ fn_exit:
     if (all_lens != NULL) free(all_lens);
     if (rcv_buff != NULL) free(rcv_buff);
     if (r_bytes_and_ranks != NULL) free(r_bytes_and_ranks);
-    if (send_buffer != NULL) OBJ_RELEASE(send_buffer);
     return rc;
 }
 
