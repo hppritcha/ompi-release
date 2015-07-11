@@ -1,6 +1,11 @@
 /*
  * Copyright (c) 2011-2013 Cisco Systems, Inc.  All rights reserved.
+<<<<<<< HEAD
  * Copyright (c) 2013      Los Alamos National Security, LLC.  All rights reserved. 
+=======
+ * Copyright (c) 2013      Los Alamos National Security, LLC.  All rights reserved.
+ * Copyright (c) 2015      Intel, Inc. All rights reserved.
+>>>>>>> 683efcb8... Rename the current opal_event_base to opal_sync_event_base in preparation for adding an async progress thread to opal. No functional changes made here - just a simple rename.
  *
  * $COPYRIGHT$
  * 
