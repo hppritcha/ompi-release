@@ -1084,26 +1084,18 @@ AC_CACHE_SAVE
 ###########################################################
 #        Fault Tolerance
 #
-# The FT code in the OMPI trunk is currently broken. We don't
-# have an active maintainer for it at this time, and it isn't
-# clear if/when we will return to it. We have therefore removed
-# the configure options supporting it until such time as it
-# can be fixed.
-#
-# However, we recognize that there are researchers who use this
-# option on their independent branches. In such cases, simply
-# uncomment the line below to render the FT configure options
-# visible again
+# Fault tolerance work has been removed from v2.x release
+# stream.  Set all preprocessor defines to 0 here to
+# reduce likelihood of merge conflicts from master.
 #
 ###########################################################
-OPAL_SETUP_FT_OPTIONS
-###########################################################
-# The following line is always required as it contains the
-# AC_DEFINE and AM_CONDITIONAL calls that set variables used
-# throughout the build system. If the above line is commented
-# out, then those variables will be set to "off". Otherwise,
-# they are controlled by the options
-OPAL_SETUP_FT
+AC_DEFINE_UNQUOTED(OPAL_ENABLE_FT,0, [ft support unavailable])
+AC_DEFINE_UNQUOTED(OPAL_ENABLE_FT_CR,0, [cr support unavailable])
+AM_CONDITIONAL(WANT_FT,0)
+AM_CONDITIONAL(WANT_FT_CR,0)
+AC_DEFINE_UNQUOTED(OPAL_ENABLE_CRDEBUG,0, [cr debugging unavailable])
+AC_DEFINE_UNQUOTED(OPAL_ENABLE_FT_THREAD,0, [no ft thread])
+AM_CONDITIONAL(WANT_FT_THREAD,0)
 
 ##################################
 # MCA
