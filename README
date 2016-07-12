@@ -173,8 +173,8 @@ Compiler Notes
             --enable-debug)
     pgi-13: 13.10 known GOOD
 
-  Users have reported hitting compiler internal errors using pgi-12/13
-  with the -m32 flag
+  Users have reported hitting compiler internal errors using pgi-12,13,
+  and 15 with the -m32 flag.
 
 - Similarly, there is a known Fortran PGI compiler issue with long
   source directory path names that was resolved in 9.0-4 (9.0-3 is
